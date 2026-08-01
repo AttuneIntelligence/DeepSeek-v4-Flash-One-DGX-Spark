@@ -1,5 +1,9 @@
 # DeepSeek-v4-Flash-One-DGX-Spark - DwarfStar 4 Engine
 
+<p align="center">
+  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+</p>
+
 Thin, idempotent launcher scripts for running the **DeepSeek-V4-Flash** server built for the NVIDIA DGX Spark (GB10 / SM121) — the DwarfStar 4 (C/CUDA) engine that serves an OpenAI-compatible `/v1` API on `:8888`.
 
 This is based on **antirez/ds4** (DwarfStar 4) and its DGX Spark fork:
