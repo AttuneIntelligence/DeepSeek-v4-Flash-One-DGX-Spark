@@ -29,7 +29,7 @@ set -euo pipefail
 
 REPO=https://github.com/Entrpi/ds4-on-spark
 PORT="${PORT:-8888}"
-CTX="${CTX:-262144}"
+CTX="${CTX:-1000000}"
 
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
 
