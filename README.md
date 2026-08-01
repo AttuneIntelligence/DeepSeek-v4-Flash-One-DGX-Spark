@@ -66,6 +66,12 @@ pkill -x ds4-server; ./start.sh   # force a clean restart
 curl http://127.0.0.1:8888/v1/models
 ```
 
+## Performance
+
+![Performance on a single NVIDIA DGX Spark](bench.jpg)
+
+Measured on a single NVIDIA DGX Spark (GB10 / SM121). **Important:** the reported decode speed (tok/s) is heavily context-dependent — as the context length grows, decode throughput drops **dramatically**. Every generated token must attend over the entire context, so longer conversations/inputs pay proportionally more attention cost per token, and the KV-cache (≈ 9.5 KiB/token) consumes more memory bandwidth. Keep `CTX` at `262144` or lower for fast interactive use unless you actually need the larger budget.
+
 ## Logs
 
 Server logs go to `~/ds4-server.log`. Check there if the server doesn't come up:
@@ -80,3 +86,4 @@ Server logs go to `~/ds4-server.log`. Check there if the server doesn't come up:
 |--------------|---------------------------------------------|
 | `start.sh`   | Fetch installer, build, download weights, serve on `:8888` |
 | `stop.sh`    | Stop the `ds4-server` process              |
+| `bench.jpg`  | Decode throughput benchmark (tok/s vs context) on a single DGX Spark |
