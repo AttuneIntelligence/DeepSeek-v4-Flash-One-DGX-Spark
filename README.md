@@ -74,7 +74,7 @@ curl http://127.0.0.1:8888/v1/models
 
 ![Performance on a single NVIDIA DGX Spark](bench.jpg)
 
-Measured on a single NVIDIA DGX Spark (GB10 / SM121). **Important:** the reported decode speed (tok/s) is heavily context-dependent — as the context length grows, decode throughput drops **dramatically**. Every generated token must attend over the entire context, so longer conversations/inputs pay proportionally more attention cost per token, and the KV-cache (≈ 9.5 KiB/token) consumes more memory bandwidth. Keep `CTX` at `262144` or lower for fast interactive use unless you actually need the larger budget.
+Measured on a single NVIDIA DGX Spark (GB10 / SM121).
 
 ## Logs
 
