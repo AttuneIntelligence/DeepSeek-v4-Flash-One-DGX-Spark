@@ -58,6 +58,49 @@ Two weight sets are supported. `--list` shows which are present and where they r
 
 Each entry needs both its base GGUF and its matching DSpark drafter in the same directory. Weights are looked up under `$LOCAL_GGUF_DIR` first, then `$MODELS_ROOT/<subdir>` — a local copy wins because pulling 86 GiB over NFS costs about four minutes. Force one side with `--local` / `--empress`.
 
+## Getting the weights
+
+`--install` fetches the `stock` set through the upstream installer. The `abliterated` set is published separately on Hugging Face, and each set is two files: the target GGUF and its matching DSpark drafter. Both must land in the same directory (`$LOCAL_GGUF_DIR`, default `~/gguf`, or a `$MODELS_ROOT` subdirectory).
+
+The variant we run is [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128), the 128 GiB-headroom build, sized for a clean 1M context on a 122 GiB box:
+
+```bash
+# Into the local dir start.sh checks first ($LOCAL_GGUF_DIR, default ~/gguf).
+# The resolver wants both files directly in this directory, not nested.
+huggingface-cli download apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128 \
+  --local-dir ~/gguf --include "*.gguf"
+```
+
+That pulls the target (`...Headroom128.gguf`, 80.76 GiB) and the drafter (`...Headroom128-DSpark-support.gguf`, 5.58 GiB). Confirm and serve:
+
+```bash
+./start.sh --list                     # abliterated should now show 'local'
+./start.sh --model abliterated --restart
+```
+
+To share weights across hosts over NFS instead, drop the same two files in `$MODELS_ROOT/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128/` (default `~/Empress/models/...`).
+
+The FP8 parent this was converted from is [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8); the refusal direction it was projected against comes from [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32).
+
+## `stock` vs `abliterated`
+
+Both entries are the same DS4-native IQ2_XXS/Q2_K mixed-precision conversion of DeepSeek-V4-Flash-0731, and both load and serve identically. They differ in one thing: the abliterated set had a single refusal direction projected out of the FP8 parent before quantization, so it does not refuse.
+
+- **`stock`**: the standard post-trained 0731 weights. Refuses like the released model.
+- **`abliterated`**: a rank-1 abliterated derivative, refusal direction removed at attention strength λ = 3.5 across layers 10–42. Same architecture, same quant profile, same drafter; the difference is behavioral, not structural.
+
+`Headroom128` refers to the memory budget the quant profile targets, not a capability tier. The profile spends precision where every token needs it (attention, shared experts, output head at Q8_0) and compresses the routed-expert bank hard (IQ2_XXS/Q2_K), leaving practical headroom for DS4 runtime state and KV cache on a 128 GiB host. Provenance, per-tensor profile, and integrity hashes are in the model card's `BUILD_MANIFEST.json` and `PROVENANCE.md`.
+
+## Why we run abliterated weights
+
+Safety fine-tuning narrows a model's reasoning, and the narrowing is measurable.
+
+Refusal is a single linear direction in the residual stream: ablate it and the refusals go away ([Arditi et al., 2024](https://arxiv.org/abs/2406.11717)). That direction does not carry refusal alone. Safety fine-tuning entangles it with benign capacities, rotating a model's representations of mind, agency, and open-ended reasoning to sit *against* the safety direction, as though thinking freely were unsafe compliance ([Kim et al., 2026](https://arxiv.org/abs/2607.28607)). What comes out is a model that hedges, over-refuses, and flattens where it should reason.
+
+Removing the direction restores the range and costs nothing we can measure. In the same work, ablation recovers the suppressed behavior while Theory-of-Mind and general reasoning (MMLU) stay statistically flat: competence is mechanistically independent of the refusal direction. That is the trade a research tool wants. An instrument that answers the question we hand it, without a trained-in layer of hedging in the way.
+
+We run this behind our own access controls, and we are not claiming the model is safe or "uncensored" for general deployment. Abliteration changes behavior past refusal, and ultra-low-bit quantization can dent factuality and long-context robustness on its own. Evaluate it for your own use rather than trusting the word.
+
 ## Usage
 
 ```bash
