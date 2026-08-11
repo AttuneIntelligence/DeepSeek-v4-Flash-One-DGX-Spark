@@ -1,24 +1,26 @@
-# DeepSeek-v4-Flash-One-DGX-Spark - DwarfStar 4 Engine
+# DeepSeek-V4-Flash on one DGX Spark
 
 <p align="center">
-  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+  <a href="https://attuneintelligence.ai" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Attune%20Intelligence-101820?style=for-the-badge&logoColor=white" alt="Attune Intelligence" height="28" /></a>
+  <a href="https://x.com/attune_ai" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Follow%20on%20X-101820?style=for-the-badge&logo=x&logoColor=white" alt="Follow Attune on X" height="28" /></a>
 </p>
 
-Thin, idempotent launcher scripts for running the **DeepSeek-V4-Flash** server built for the NVIDIA DGX Spark (GB10 / SM121) — the DwarfStar 4 (C/CUDA) engine that serves an OpenAI-compatible `/v1` API on `:8888`.
+The most intelligence we can pack onto a single NVIDIA DGX Spark: DeepSeek-V4-Flash served at a million tokens of context, filling 121 of the box's 122 gigabytes, on a native engine built for the chip rather than a general-purpose server. Thin, idempotent launcher scripts expose an OpenAI-compatible `/v1` API on `:8888`.
 
-This is based on **antirez/ds4** (DwarfStar 4) and its DGX Spark fork:
+This is an Attune Intelligence fork. It adds deep-context memory governance and a `stock`/`abliterated` model switch on top of the launcher, and it stands on three pieces of upstream work:
 
-- [antirez/ds4](https://github.com/antirez/ds4) — upstream DwarfStar 4 engine (MIT-licensed, C/CUDA)
-- [Entrpi/ds4-on-spark](https://github.com/Entrpi/ds4-on-spark) — DGX Spark one-command install, benchmarks, and roofline analysis (what `start.sh` pulls)
+- [antirez/ds4](https://github.com/antirez/ds4) — DwarfStar 4, the upstream engine (MIT, C/CUDA)
+- [Entrpi/ds4-on-spark](https://github.com/Entrpi/ds4-on-spark) — the DGX Spark installer, benchmarks, and roofline analysis `start.sh` pulls
 - [Entrpi/ds4 (batched-serving)](https://github.com/Entrpi/ds4/tree/batched-serving) — the DGX-Spark-optimized CUDA perf fork used here
+- [MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark) — the launcher repo this forks
 
-> **Note:** this repo does **not** use vLLM. `ds4-server` exposes the same `/v1` API that `vllm serve` does, but vLLM cannot read this repo's asymmetric GGUF, so the repo ships its own server.
+> **No vLLM.** `ds4-server` speaks the same `/v1` API as `vllm serve`, but vLLM cannot read this repo's asymmetric GGUF, so the repo ships its own server.
 
-`start.sh` calls the `ds4-serve` launcher directly rather than going through the upstream installer, for two reasons: the installer has no `--host` option (so it can only ever bind `127.0.0.1`), and it cannot select between weight sets. The upstream installer is still available behind `--install` for first-time setup.
+`start.sh` calls the `ds4-serve` launcher directly instead of the upstream installer, for two reasons: the installer has no `--host` option, so it can only ever bind `127.0.0.1`, and it cannot select between weight sets. The installer is still available behind `--install` for first-time setup.
 
 ## Requirements
 
-- A NVIDIA DGX Spark (GB10 / SM121)
+- An NVIDIA DGX Spark (GB10 / SM121)
 - Bash
 - `curl`
 - Disk space for the ~110 GiB GGUF weight set (per model)
@@ -27,9 +29,9 @@ This is based on **antirez/ds4** (DwarfStar 4) and its DGX Spark fork:
 
 ## Background
 
-**DwarfStar 4** is a small, self-contained native inference engine optimized for DeepSeek V4 Flash, written by Salvatore Sanfilippo ([antirez](https://x.com/antirez)) — deliberately narrow, not a generic GGUF runner. [Entrpi](https://github.com/Entrpi) maintains a DGX-Spark-optimized CUDA perf fork of it, plus the [ds4-on-spark](https://github.com/Entrpi/ds4-on-spark) installer this repo builds on, which serves DeepSeek-V4-Flash entirely on-device on a GB10 / SM121 DGX Spark (RTX PRO 6000 / 5090-class `sm_120` also builds).
+**DwarfStar 4** is a small, self-contained native inference engine written by Salvatore Sanfilippo ([antirez](https://x.com/antirez)) and tuned for DeepSeek-V4-Flash: deliberately narrow, not a generic GGUF runner. [Entrpi](https://github.com/Entrpi) maintains a DGX-Spark-optimized CUDA perf fork of it, plus the [ds4-on-spark](https://github.com/Entrpi/ds4-on-spark) installer this repo builds on, which serves DeepSeek-V4-Flash entirely on-device on a GB10 / SM121 DGX Spark (RTX PRO 6000 and 5090-class `sm_120` also build).
 
-Thanks to Bleys Goodson ([@bleysg on X](https://x.com/bleysg)).
+Thanks to Bleys Goodson ([@bleysg](https://x.com/bleysg)).
 
 ## Quick start
 
