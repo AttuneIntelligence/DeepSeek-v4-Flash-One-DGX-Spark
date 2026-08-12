@@ -324,22 +324,42 @@ def suite_needle(b: Bench, args) -> list[dict]:
 
 
 def suite_cache(b: Bench, args) -> list[dict]:
-    depth = args.depth
-    prompt = (filler(depth, "session fixed-for-cache-suite") +
-              "\n\nSummarise the log above in two sentences.")
-    cold = sample(b, prompt, args.tokens)
-    warm = sample(b, prompt, args.tokens)
-    print("%6s %9s %9s %9s %11s" % ("pass", "prompt", "cached", "ttft_ms", "decode t/s"))
-    for label, s in (("cold", cold), ("warm", warm)):
-        print("%6s %9d %9d %9s %11.2f"
-              % (label, s["prompt_tokens"], s["cached_tokens"],
-                 "%.0f" % s["ttft_ms"] if s["ttft_ms"] else "-", s["decode_tok_s"]))
-    if cold["ttft_ms"] and warm["ttft_ms"]:
-        print("warm TTFT is %.0fx faster (%.0f ms vs %.0f ms), %d of %d tokens reused"
-              % (cold["ttft_ms"] / warm["ttft_ms"], warm["ttft_ms"], cold["ttft_ms"],
-                 warm["cached_tokens"], warm["prompt_tokens"]))
-    return [dict(suite="cache", pass_=l, **{k: v for k, v in s.items() if k != "text"})
-            for l, s in (("cold", cold), ("warm", warm))]
+    """Cold prefill vs warm-admit reuse of the same prompt.
+
+    Each repeat gets its own nonce. Reusing one prompt across repeats would make
+    every "cold" pass after the first a cache hit, and the suite would report a
+    speedup of roughly 1x while looking perfectly healthy.
+    """
+    rows = []
+    speedups = []
+    print("%5s %6s %9s %9s %10s %11s"
+          % ("run", "pass", "prompt", "cached", "ttft_ms", "decode t/s"))
+    for i in range(max(1, args.repeat)):
+        prompt = (filler(args.depth, nonce()) +
+                  "\n\nSummarise the log above in two sentences.")
+        cold = sample(b, prompt, args.tokens)
+        warm = sample(b, prompt, args.tokens)
+        for label, s in (("cold", cold), ("warm", warm)):
+            print("%5d %6s %9d %9d %10s %11.2f"
+                  % (i + 1, label, s["prompt_tokens"], s["cached_tokens"],
+                     "%.0f" % s["ttft_ms"] if s["ttft_ms"] else "-",
+                     s["decode_tok_s"]))
+            rows.append(dict(suite="cache", pass_=label, run=i + 1,
+                             **{k: v for k, v in s.items() if k != "text"}))
+        if cold["ttft_ms"] and warm["ttft_ms"]:
+            speedups.append(cold["ttft_ms"] / warm["ttft_ms"])
+
+    if speedups:
+        lo, hi = min(speedups), max(speedups)
+        med = statistics.median(speedups)
+        print("warm TTFT speedup: median %.0fx over %d run(s)%s"
+              % (med, len(speedups),
+                 "" if len(speedups) < 2 else " (range %.0fx-%.0fx)" % (lo, hi)))
+        for r in rows:
+            r["speedup_median"] = round(med, 1)
+            r["speedup_min"] = round(lo, 1)
+            r["speedup_max"] = round(hi, 1)
+    return rows
 
 
 SUITES = {

@@ -13,6 +13,7 @@ from different runs can be concatenated safely.
 | `abliterated-concurrency.jsonl` | `concurrency` | 32k prompts, 1/2/4 streams — **prefill-contaminated, kept as the counter-example** |
 | `abliterated-concurrency-ctx1m.jsonl` | `concurrency` | 512-token prompts, 256 tokens generated — the clean decode-batching read |
 | `abliterated-needle.jsonl` | `needle` | 32k and 128k, three placements each, thinking disabled |
+| `abliterated-cache.jsonl` | `cache` | 128k prompt, cold vs warm, 3 runs with independent nonces |
 
 Fields worth knowing:
 
@@ -26,6 +27,10 @@ Fields worth knowing:
 - `spread_tok_s` is the best-minus-worst across `--repeat` samples. It is often
   large at shallow depth because CUDA graphs get invalidated and recaptured;
   treat single-sample differences under ~15% as noise.
+- `speedup_median` / `_min` / `_max` on `cache` rows summarise the whole run, so
+  a single row is enough to quote the result honestly. Each repeat uses its own
+  nonce; reusing one prompt would make every cold pass after the first a cache
+  hit and collapse the measured speedup to ~1x.
 - `thinking` records whether ds4's default thinking mode was left on. It is off
   for these runs — see [`../../docs/inference-controls.md`](../../docs/inference-controls.md).
 

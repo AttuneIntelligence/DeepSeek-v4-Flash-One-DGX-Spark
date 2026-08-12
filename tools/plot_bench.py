@@ -170,6 +170,9 @@ def main(argv):
     cache = [r for r in rows if r.get("suite") == "cache"]
     cold = next((r for r in cache if r.get("pass_") == "cold"), None)
     warm = next((r for r in cache if r.get("pass_") == "warm"), None)
+    # Prefer the median over repeats when the suite recorded one; a single
+    # cold/warm pair moves by tens of percent run to run.
+    speedup_median = warm.get("speedup_median") if warm else None
 
     xs = [r["prompt_tokens"] for r in depth]
     dec = [r["decode_tok_s"] for r in depth]
@@ -206,12 +209,15 @@ def main(argv):
            font=F_NOTE, fill=INK)
 
     if cold and warm and warm.get("ttft_ms") and cold.get("ttft_ms"):
-        speedup = cold["ttft_ms"] / warm["ttft_ms"]
+        speedup = speedup_median or (cold["ttft_ms"] / warm["ttft_ms"])
+        spread = ""
+        if warm.get("speedup_min") and warm.get("speedup_max"):
+            spread = " (median of 3, %.0fx-%.0fx)" % (warm["speedup_min"],
+                                                      warm["speedup_max"])
         d.text((70, note_y + 24),
-               "Prefill is a one-time cost: the same %s-token prompt re-sent takes "
-               "%.0f ms instead of %.0f ms (%.0fx), %s of %s tokens reused from cache."
-               % (human_tokens(warm["prompt_tokens"]), warm["ttft_ms"],
-                  cold["ttft_ms"], speedup,
+               "Prefill is a one-time cost: re-sending the same %s-token prompt "
+               "reaches first token %.0fx sooner%s, %s of %s tokens reused from cache."
+               % (human_tokens(warm["prompt_tokens"]), speedup, spread,
                   human_tokens(warm.get("cached_tokens", 0)),
                   human_tokens(warm["prompt_tokens"])),
                font=F_NOTE, fill=WARM)

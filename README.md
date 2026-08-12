@@ -302,14 +302,14 @@ Full method, caveats and the reasoning behind every serving default: [`docs/perf
 
 At 771k tokens — 77% of the window — decode still runs at 49% of peak while carrying 24x the context.
 
-**Prefix caching is what makes that window practical.** The same 128k prompt, twice:
+**Prefix caching is what makes that window practical.** The same 128k prompt sent twice, median of three runs:
 
 | pass | served from cache | TTFT | decode tok/s |
 |---|---:|---:|---:|
-| cold | 0 | 131,116 ms | 13.5 |
-| warm | 128,512 of 128,525 | **541 ms** | 19.2 |
+| cold | 0 | 134,429 ms | 26.4 |
+| warm | 128,512 of 128,530 | **462 ms** | 32.6 |
 
-242x faster to first token. A coding agent does not resend 300k fresh tokens per turn, it sends the same context plus a diff — so the linear prefill cost of depth is a one-time entry fee per session, not a per-turn tax. That is the argument for keeping the window at 1M rather than trading it for the ~10% of decode rate a 262k window buys back.
+**292x faster to first token** (range 289x-316x across three runs). A coding agent does not resend 300k fresh tokens per turn, it sends the same context plus a diff — so the linear prefill cost of depth is a one-time entry fee per session, not a per-turn tax. That is the argument for keeping the window at 1M rather than trading it for the ~10% of decode rate a 262k window buys back: a smaller window would not make warm turns faster, it would only evict them and charge the 134-second cold prefill again.
 
 **Concurrency is real headroom** — 1.9x aggregate decode at 4 streams — but it costs per-stream latency, so it is throughput for a fleet rather than speed for one user.
 

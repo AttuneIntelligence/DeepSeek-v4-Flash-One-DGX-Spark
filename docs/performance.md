@@ -60,15 +60,30 @@ number that justifies the entire configuration.
 
 ## Prefix caching: why 1M context is practical
 
-Same 128k prompt, twice, at `CTX=1000000`:
+Same 128k prompt sent twice, three independent runs at `CTX=1000000`. Each run
+uses a fresh nonce, so every cold pass really is cold:
 
-| pass | prompt tokens | served from cache | TTFT | decode tok/s |
-|---|---:|---:|---:|---:|
-| cold | 128,525 | 0 | 131,116 ms | 13.5 |
-| warm | 128,525 | **128,512** | **541 ms** | 19.2 |
+| run | pass | served from cache | TTFT | decode tok/s |
+|---:|---|---:|---:|---:|
+| 1 | cold | 0 | 134,950 ms | 26.8 |
+| 1 | warm | 128,512 | **462 ms** | 32.6 |
+| 2 | cold | 0 | 133,399 ms | 24.3 |
+| 2 | warm | 128,512 | **462 ms** | 31.5 |
+| 3 | cold | 0 | 134,429 ms | 26.4 |
+| 3 | warm | 128,512 | **426 ms** | 35.1 |
 
-**242x faster to first token**, with 99.99% of the prompt reused. In the server
-log this is the `warm admit` path:
+**Median 292x faster to first token** (range 289x-316x), with 99.99% of the
+prompt reused. Both halves are stable across runs -- cold within 1%, warm within
+8% -- so the spread in the ratio is small. Earlier single-sample measurements of
+this gave 242x and 349x; neither was wrong, both were undersampled, which is why
+the suite now takes `--repeat`.
+
+Warm decode is also consistently faster than cold (31.5-35.1 vs 24.3-26.8
+tok/s). A request admitted against a warm bank is not merely skipping prefill,
+it starts generating in a better state than one that just finished pushing 128k
+tokens through the prefill path.
+
+In the server log this is the `warm admit` path:
 
 ```
 ds4-server: warm admit bank=4 cached=277259 suffix=581
@@ -85,7 +100,8 @@ prefill cost above is a one-time entry fee, not a per-turn tax.
 That is the rationale for keeping the window large: **context depth is cheap to
 hold and cheap to extend; it is only expensive to establish.** A smaller window
 would not make warm turns faster — they are already sub-second — it would only
-force eviction and turn cheap warm turns back into expensive cold ones.
+force eviction and turn cheap warm turns back into expensive cold ones -- a 134
+second penalty, every time it happens.
 
 ## Retrieval: the window is used, not just held
 
@@ -160,7 +176,7 @@ GiB lets the batch lane take 8 banks instead of 4.
 **We keep 1M anyway.** The gain is ~10% on single-stream decode, with spreads
 wide enough that a single sample can show either sign. Against that, 262k means a
 coding session that exceeds 262k tokens stops being a warm session and starts
-paying the 242x cold-prefill penalty on every eviction. Ten percent of decode rate
+paying the ~134 s cold-prefill penalty on every eviction. Ten percent of decode rate
 is a poor trade for the ability to keep a large repository resident. If your
 workload is many short concurrent chats rather than one deep session, invert this
 choice: `make serve CTX=262144` with `COALESCE_MAX=8` is the throughput
@@ -224,7 +240,7 @@ before benchmarking anything, or you will benchmark your network.
 
 | setting | value | why |
 |---|---|---|
-| `CTX` | 1000000 | Warm turns cost ~0.5 s at any depth; eviction costs 242x. Worth ~10% decode. |
+| `CTX` | 1000000 | Warm turns cost ~0.46 s at any depth; eviction costs 134 s. Worth ~10% decode. |
 | `COALESCE_MAX` | 4 | What fits at 1M. 8 banks needs the memory that 1M context is using. |
 | `MAX_OUT` | 32768 | Every admission credits `prompt + max_out` of KV growth; ds4's 393216 default reserves 461k tokens for a 68k prompt. |
 | `SERIAL_MAX_TOKENS` | `$CTX` | ds4's hardcoded 65536 is a cliff at 6.5% of a 1M window. |
