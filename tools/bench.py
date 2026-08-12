@@ -81,6 +81,13 @@ class Bench:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())
 
+    def get_json(self, path: str):
+        """/v1/stats content-negotiates and answers in plain text without this."""
+        req = urllib.request.Request(self.url + path,
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+
     def complete(self, prompt: str, max_tokens: int, system: str | None = None):
         """One non-streaming completion. Returns (wall_seconds, response).
 
@@ -363,6 +370,109 @@ def suite_cache(b: Bench, args) -> list[dict]:
     return rows
 
 
+def suite_fanout(b: Bench, args) -> list[dict]:
+    """N agents asking different questions of ONE shared deep context.
+
+    This is the workload the `concurrency` suite deliberately is not. There every
+    stream got a unique nonce to defeat prefix reuse, which isolates decode but
+    describes nobody's real usage. Here every stream shares a byte-identical deep
+    prefix and differs only in its trailing question -- one repo in context, four
+    subagents interrogating it.
+
+    ds4 can fork a live bank for a request that shares its prefix rather than
+    prefilling again (`admits_fork` / `admits_partial_fork`). The prefix is sent
+    once up front to establish the bank, so the fan-out measures reuse rather
+    than a cold race. Watch the admit counters: if forks do not fire, you are
+    paying full prefill per agent and the shape of the win is completely
+    different.
+    """
+    QUESTIONS = [
+        "How many spare gaskets remain, and in which room?",
+        "Which shift reported nominal pressure, and across how many lines?",
+        "What maintenance was performed, and on what day of the week?",
+        "What is scheduled for the following quarter?",
+        "Were any alarms raised? Answer yes or no and cite the line.",
+        "How many lines are described in total?",
+        "What component was replaced?",
+        "Summarise the log in one sentence.",
+    ]
+    prefix = filler(args.depth, nonce())
+
+    def counters() -> dict:
+        try:
+            st = b.get_json("/v1/stats")
+        except Exception:                                   # noqa: BLE001
+            return {}
+        return dict(st.get("cache", {}))
+
+    print("establishing the shared bank (one cold prefill of %d requested tokens) ..."
+          % args.depth)
+    seed_row = sample(b, prefix + "\n\nReply with the single word: ready.", 8)
+    print("  bank established: %d prompt tokens, ttft %.0f ms"
+          % (seed_row["prompt_tokens"], seed_row["ttft_ms"] or 0))
+
+    rows = []
+    print("%8s %11s %12s %12s %11s %9s %8s"
+          % ("agents", "wall tok/s", "decode agg", "per-agent", "ttft_ms p50",
+             "forks", "errors"))
+    for n in args.streams:
+        before = counters()
+        results: list[dict] = []
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def worker(i: int):
+            prompt = prefix + "\n\n" + QUESTIONS[i % len(QUESTIONS)]
+            try:
+                r = sample(b, prompt, args.tokens)
+            except Exception as e:                          # noqa: BLE001
+                with lock:
+                    errors.append(str(e))
+                return
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        t0 = time.perf_counter()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.perf_counter() - t0
+        after = counters()
+
+        def delta(key: str) -> int:
+            return int(after.get(key, 0)) - int(before.get(key, 0))
+
+        forks = delta("admits_fork") + delta("admits_partial_fork")
+        warm = delta("admits_warm")
+        cold = delta("admits_cold")
+        produced = sum(r["output_tokens"] for r in results)
+        wall = produced / elapsed if elapsed else 0.0
+        dec_agg = sum(r["decode_tok_s"] for r in results)
+        per = dec_agg / len(results) if results else 0.0
+        ttfts = [r["ttft_ms"] for r in results if r["ttft_ms"] is not None]
+        p50 = statistics.median(ttfts) if ttfts else None
+        reused = sum(1 for r in results if r["cached_tokens"] > 0)
+
+        print("%8d %11.2f %12.2f %12.2f %11s %9d %8d"
+              % (n, wall, dec_agg, per, "%.0f" % p50 if p50 else "-", forks, len(errors)))
+        if errors:
+            print("    first error: %s" % errors[0][:120])
+        print("         admits: cold=%d warm=%d fork=%d | %d of %d agents reused a prefix"
+              % (cold, warm, forks, reused, n))
+        rows.append({
+            "suite": "fanout", "agents": n, "depth": args.depth,
+            "prompt_tokens": seed_row["prompt_tokens"],
+            "wall_tok_s": round(wall, 2),
+            "aggregate_decode_tok_s": round(dec_agg, 2),
+            "per_agent_tok_s": round(per, 2), "ttft_ms_p50": p50,
+            "admits_cold": cold, "admits_warm": warm, "admits_fork": forks,
+            "agents_reusing_prefix": reused, "errors": len(errors),
+        })
+    return rows
+
+
 def suite_restart(b: Bench, args) -> list[dict]:
     """Does a deep prompt survive a server restart?
 
@@ -436,6 +546,7 @@ SUITES = {
     "needle": suite_needle,
     "cache": suite_cache,
     "restart": suite_restart,
+    "fanout": suite_fanout,
 }
 
 
@@ -493,7 +604,7 @@ def main(argv: list[str]) -> int:
     # `restart` bounces the server, so it is opt-in only and never part of `all`.
     names = [args.suite]
     if args.suite == "all":
-        names = ["smoke", "depth", "cache", "concurrency", "needle"]
+        names = ["smoke", "depth", "cache", "concurrency", "fanout", "needle"]
 
     rows = []
     for name in names:

@@ -196,6 +196,28 @@ Environment variables (all optional; each has a matching flag):
 
 The last four are deliberate deviations from ds4's own defaults — see below.
 
+## Capabilities, measured
+
+Full detail and method in [`docs/capabilities.md`](docs/capabilities.md). The short version:
+
+**The abliterated default is not measurably less capable than stock.** Same 16 GPQA Diamond / SuperGPQA / AIME2025 questions, `--temp 0 --seed 1 -n 1536`, via `ds4-eval`:
+
+| | stock | abliterated |
+|---|---:|---:|
+| passed | 13/16 | 13/16 |
+| items failed | 4, 9, 15 | **4, 9, 15** |
+| generated tokens | 12,105 | 13,555 (+12%) |
+
+Both failed the *same three* items, all of them budget truncations at the token cap — item-level agreement is a stronger signal than the matching score. N=16 has low statistical power, so this rules out a large regression from abliteration-plus-2-bit quantization, not a small one. It is the first local evidence either way; previously the README argued this from papers about full-precision models. The one real cost is verbosity: abliterated spends 12% more tokens for the same score. `make eval`
+
+**Retrieval holds at 514k tokens** — 9/9 needles across 32k, 128k and 514k at three depths each, including 90% depth. The window is used, not just held.
+
+**Four agents can share one deep context.** 128k context, four agents asking different questions: ~5 s to first token and 31 tok/s aggregate, against ~524 s if each prefilled its own copy. Reuse arrives via disk-checkpoint restores into separate banks (124–236 ms each), not in-memory forks. `make bench-fanout`
+
+**The whole ds4 engine fits in the window** — 168k lines of C/CUDA packs to ~534k tokens, so you can stop chunking and retrieving. `tools/repo-context.sh pack | warm | ask`
+
+**One trap worth internalising:** a tool-result turn reuses 96% of the prompt if the client echoes the assistant message back *verbatim with `tool_calls[].id` intact*, and **0%** if it reconstructs it. With a 300k-token prefix that is 0.5 s versus 5+ minutes per tool call.
+
 ## Steering at the inference layer
 
 Your client is not the only place behaviour is decided. Three `ds4-server` defaults will surprise you if you assume llama.cpp or vLLM semantics — full detail in [`docs/inference-controls.md`](docs/inference-controls.md).
@@ -354,6 +376,8 @@ Lines worth watching:
 | `tools/gguf_dspark_remap.py` | Repair a legacy `mtp.*` DSpark drafter into ds4's `dspark.*` layout |
 | `tools/bench.py` | Benchmark harness: depth, concurrency, retrieval, cache, restart |
 | `tools/kv-status.sh` | Disk KV tier: usage, budget pressure, restores, admissions |
+| `tools/repo-context.sh` | Pack a whole repo into the window; warm it once, then ask |
+| `docs/capabilities.md` | Capability eval, retrieval at depth, fan-out, tool-loop trap |
 | `docs/dspark-drafter-repair.md` | Why the abliterated drafter needs repairing, and exactly what changes |
 | `tools/plot_bench.py` | Render `bench.png` from the recorded results |
 | `docs/performance.md` | Every serving default, justified with measurements |
