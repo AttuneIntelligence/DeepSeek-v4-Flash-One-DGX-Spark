@@ -49,6 +49,7 @@ import json
 import os
 import random
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -362,12 +363,79 @@ def suite_cache(b: Bench, args) -> list[dict]:
     return rows
 
 
+def suite_restart(b: Bench, args) -> list[dict]:
+    """Does a deep prompt survive a server restart?
+
+    This is the disk KV tier (`--kv-disk-dir`). Without it a restart drops every
+    resident bank and the second pass re-prefills from scratch; with it the bank
+    is restored from a checkpoint. The suite proves which one you have.
+
+    Both passes send a byte-identical prompt. The nonce is drawn once and reused,
+    so the cold pass is genuinely cold even if earlier runs left checkpoints on
+    disk, while the warm pass can still hit the one this run just wrote.
+
+    This suite restarts your server. It is deliberately excluded from `all`.
+    """
+    fixed = nonce()
+    prompt = (filler(args.depth, fixed) +
+              "\n\nSummarise the log above in two sentences.")
+
+    print("cold pass (this is a full prefill; expect minutes at depth) ...")
+    cold = sample(b, prompt, args.tokens)
+
+    print("restarting: %s" % args.restart_cmd)
+    t0 = time.perf_counter()
+    proc = subprocess.run(args.restart_cmd, shell=True, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise RuntimeError("restart command failed (%d): %s"
+                           % (proc.returncode, " / ".join(tail)))
+    for _ in range(int(args.restart_timeout)):
+        try:
+            b.get("/v1/models")
+            break
+        except Exception:                                  # noqa: BLE001
+            time.sleep(1)
+    else:
+        raise RuntimeError("server did not come back within %ss" % args.restart_timeout)
+    boot_s = time.perf_counter() - t0
+    print("back up after %.0fs" % boot_s)
+
+    warm = sample(b, prompt, args.tokens)
+
+    print("%22s %9s %9s %10s %11s"
+          % ("pass", "prompt", "cached", "ttft_ms", "decode t/s"))
+    rows = []
+    for label, s_ in (("cold", cold), ("after restart", warm)):
+        print("%22s %9d %9d %10s %11.2f"
+              % (label, s_["prompt_tokens"], s_["cached_tokens"],
+                 "%.0f" % s_["ttft_ms"] if s_["ttft_ms"] else "-",
+                 s_["decode_tok_s"]))
+        rows.append(dict(suite="restart", pass_=label.replace(" ", "_"),
+                         restart_boot_s=round(boot_s, 1),
+                         **{k: v for k, v in s_.items() if k != "text"}))
+
+    if warm["cached_tokens"] == 0:
+        print("NOT RESTORED: the warm pass re-prefilled from scratch. Either disk KV")
+        print("  is off (start.sh --kv-disk-dir / KV_DISK_DIR) or the checkpoint was")
+        print("  never written -- ds4's --kv-cache-cold-max-tokens defaults to 30000.")
+    elif cold["ttft_ms"] and warm["ttft_ms"]:
+        speedup = cold["ttft_ms"] / warm["ttft_ms"]
+        print("RESTORED %d of %d tokens: TTFT %.0f ms vs %.0f ms (%.0fx) across a restart"
+              % (warm["cached_tokens"], warm["prompt_tokens"],
+                 warm["ttft_ms"], cold["ttft_ms"], speedup))
+        for r in rows:
+            r["restart_speedup"] = round(speedup, 1)
+    return rows
+
+
 SUITES = {
     "smoke": suite_smoke,
     "depth": suite_depth,
     "concurrency": suite_concurrency,
     "needle": suite_needle,
     "cache": suite_cache,
+    "restart": suite_restart,
 }
 
 
@@ -387,6 +455,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=1800)
+    ap.add_argument("--restart-cmd", default="./start.sh --restart",
+                    help="how the `restart` suite bounces the server")
+    ap.add_argument("--restart-timeout", type=float, default=900,
+                    help="seconds to wait for the server to answer after a restart")
     ap.add_argument("--out", default=None)
     ap.add_argument("--markdown", default=None)
     ap.add_argument("--thinking", action="store_true",
@@ -418,7 +490,8 @@ def main(argv: list[str]) -> int:
                             if args.thinking else "disabled"))
     print()
 
-    names = list(SUITES) if args.suite == "all" else [args.suite]
+    # `restart` bounces the server, so it is opt-in only and never part of `all`.
+    names = [args.suite]
     if args.suite == "all":
         names = ["smoke", "depth", "cache", "concurrency", "needle"]
 

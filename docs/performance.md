@@ -258,6 +258,19 @@ bank restore admit bank=0 bytes=691490 lcp=691340 partial=1
 The checkpoint was 549 MiB for 125k tokens — about **4.6 KiB/token on disk**
 against ~35.6 KiB/token resident, because the on-disk form is packed-native.
 
+Reproducible, since this is now a headline claim:
+
+```bash
+make bench-restart            # prefill deep, restart the server, re-send, record
+```
+
+That run (recorded in `bench/results/abliterated-restart.jsonl`) measured
+133,091 ms cold vs **2,140 ms** after restart — **62x** — restoring 128,512 of
+128,530 tokens. The hand-rolled test above measured 30x on the same prompt. The
+cold side is stable; the warm side varies (2,140 ms vs 4,219 ms), so treat the
+speedup as **30-60x** rather than a single figure. Either way it is the
+difference between a restart costing a session and costing a coffee sip.
+
 This changes the economics of everything above. The warm-path argument for a 1M
 window previously had a hole in it: warm turns cost 0.46 s, but *any* restart —
 to switch models, retune the memory floor, or clear a wedge — dropped you back to
@@ -308,6 +321,53 @@ ships `DS4_CUDA_STAGE_PROF_LITE=1` for per-stage GPU spans (valid in production)
 `speed-bench/deep_decode_profile.sh`, which nsys-profiles *only* the warm decode
 window after a deep cold admit. We have not run these yet.
 
+## Where decode time actually goes
+
+`DS4_CUDA_STAGE_PROF_LITE=1` gives per-stage GPU spans in production. To read
+decode without prefill contaminating it, both samples below are decode-dominated:
+512 generated tokens, and the deep one is a **warm disk restore** so it does no
+prefill at all. Figures are ms per forward pass.
+
+| stage | 512-token context | 125k-token context | change |
+|---|---:|---:|---|
+| `fwd` (total) | 98.66 | 103.47 | +5% |
+| `moe` | 42.12 | 33.32 | -21% |
+| `attn` | 15.98 | 18.69 | +17% |
+| `ffn` | 12.40 | 11.25 | -9% |
+| `attncore` | 1.99 | **6.97** | **+250%** |
+| `idxscore` | 0.99 | 0.95 | flat |
+| `head` | 2.85 | 2.75 | flat |
+| measured decode | 18.2 tok/s | 17.7 tok/s | -3% |
+
+Three conclusions, one of them a correction.
+
+**Decode is MoE-bound, not attention-bound, at these depths.** The routed-expert
+stage is the single largest cost at both depths, and it does not grow with
+context. That is the bandwidth wall from the earlier section, seen directly: the
+cost of decode is streaming expert weights, which is why the GPU sits at 96% and
+why concurrency (which amortises that traffic across sequences) is the only lever
+that produced a real multiple.
+
+**`attncore` is the only stage that grows materially with depth** — 3.5x for 245x
+more context. Sub-linear, and still only ~7% of the forward pass at 125k.
+Extrapolating, it does not become the dominant term until several hundred
+thousand tokens, which is consistent with the depth curve staying flat through
+257k and only bending at 514k-771k.
+
+**The correction**: at 125k this profile shows decode essentially unchanged from
+shallow (17.7 vs 18.2 tok/s), while the depth sweep showed 21.2 vs 27.2. The
+difference is that these two samples are warm and the sweep's were cold — a
+request that has just pushed 128k tokens through prefill decodes slower than one
+restored from a checkpoint, the same effect noted in the cache section. So part of
+what the depth curve attributes to "context depth" is really "recently did a huge
+prefill". The curve is still the right thing to publish for cold behaviour, but
+the warm-path degradation with depth is milder than it suggests.
+
+No new tuning lever came out of this. The profiler confirmed the diagnosis rather
+than opening a door: the floor is expert-weight bandwidth, and no flag moves it.
+If you want to push further, `speed-bench/deep_decode_profile.sh` nsys-profiles
+the decode window at 771k, where `attncore` should finally dominate.
+
 ## The serial-lane wedge has a root cause, and it is structural
 
 This repo already documented the wedge — the serial session right-sizes upward
@@ -330,14 +390,17 @@ Two further findings worth knowing:
   buffered tool turns, live-frontier continuations, prefill-only — dispatch at
   `ds4_server.c:15664` without consulting it, and grow the graph freely. This is
   probably how a box with a 65536 guard reached 78924.
-- **Our `SERIAL_MAX_TOKENS=$CTX` may be backwards.** The engine's comment at
-  `ds4_server.c:15513` argues the opposite of this repo's README: at deep context
-  the serial lane takes the managed-KV fallback at "minutes of prefill, ~40x
-  slower decode", and the reject that bounced the job there is usually transient,
-  so a fast 503 the client can retry is better than a silent 40x degradation.
-  Setting the guard to the full context disables it. We have not changed this
-  yet — it deserves its own measurement, because "fail fast" and "always succeed
-  eventually" are a product decision, not just a perf one.
+- **`SERIAL_MAX_TOKENS=$CTX` was backwards, and has been reverted to ds4's
+  default.** The engine's comment at `ds4_server.c:15513` argues the opposite of
+  what this repo previously did: at deep context the serial lane takes the
+  managed-KV fallback at "minutes of prefill, ~40x slower decode", and the reject
+  that bounced the job there is usually transient. Raising the guard to `$CTX`
+  did not convert failures into successes — it converted fast, retryable 503s
+  into requests that appear to hang for minutes and then return at ~0.5 tok/s.
+  Two premises behind the old choice no longer hold: the guard was believed to be
+  what kept deep prompts working (it is not — it only covers the fallback sweep),
+  and recovering from a wedge was believed to cost every deep session (with disk
+  KV it costs ~2-4 s). `--serial-max-tokens $CTX` restores the old behaviour.
 
 Mitigations exist and all have real costs. `DS4_SERVER_SERIAL_RIGHTSIZE=0`
 (`ds4_server.c:17569`) stops the ratchet completely by making the serial lane

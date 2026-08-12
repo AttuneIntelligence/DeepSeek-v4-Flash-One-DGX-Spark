@@ -23,6 +23,9 @@ DEST       ?= local
 URL        ?= http://127.0.0.1:$(PORT)
 LOG        ?= $(HOME)/ds4-server.log
 RESULTS    ?= bench/results
+RESTART_DEPTH ?= 131072
+KV_DISK_DIR ?= $(HOME)/ds4-kv
+KV_DISK_MB  ?= 65536
 STAMP      := $(shell date +%Y%m%d-%H%M%S)
 
 START      := ./start.sh
@@ -30,6 +33,7 @@ STOP       := ./stop.sh
 FETCH      := tools/fetch-weights.sh
 REMAP      := tools/gguf_dspark_remap.py
 BENCH      := tools/bench.py
+KVSTATUS   := tools/kv-status.sh
 PLOT       := tools/plot_bench.py
 INSTALLER  := https://github.com/Entrpi/ds4-on-spark/raw/main/install.sh
 
@@ -39,7 +43,7 @@ model_field = $(shell . tools/models.sh >/dev/null 2>&1; . tools/models.sh; mode
 .PHONY: help bootstrap engine weights weights-all weights-check localize \
         repair verify serve start stop restart status logs list dry-run \
         bench bench-quick bench-depth bench-concurrency bench-needle bench-cache \
-        plot results lint clean-results
+        bench-restart kv-status kv-watch plot results lint clean-results
 
 ## ---------------------------------------------------------------- meta
 
@@ -159,6 +163,18 @@ bench-needle: ## Retrieval accuracy at depth
 
 bench-cache: ## Cold vs warm prefill on the same deep prompt
 	$(BENCH) cache --url $(URL) --model $(MODEL)
+
+bench-restart: ## Does a deep prompt survive a server restart? (RESTARTS the server)
+	@mkdir -p $(RESULTS)
+	$(BENCH) restart --depth $(RESTART_DEPTH) --url $(URL) --model $(MODEL) \
+	    --restart-cmd "$(START) --restart --model $(MODEL) --port $(PORT) --ctx $(CTX)" \
+	    --out $(RESULTS)/$(MODEL)-restart.jsonl
+
+kv-status: ## Disk KV tier: usage, budget pressure, restores, admissions
+	@KV_DISK_DIR=$(KV_DISK_DIR) KV_DISK_MB=$(KV_DISK_MB) PORT=$(PORT) $(KVSTATUS)
+
+kv-watch: ## kv-status, refreshing every 30s
+	@KV_DISK_DIR=$(KV_DISK_DIR) KV_DISK_MB=$(KV_DISK_MB) PORT=$(PORT) $(KVSTATUS) --watch
 
 plot: ## Redraw bench.png from the recorded results
 	$(PLOT) --results $(RESULTS) --model $(MODEL) --out bench.png

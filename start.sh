@@ -88,14 +88,33 @@
 #   COALESCE 32 ds4 asks for 32 banks, the fit claws it back to ~9, and those
 #               still commit ~7 of the 15 free GiB. This box cannot serve 32
 #               concurrent 1M streams; 4 returns ~3.8 GiB to the usable pool.
-#   SERIAL_MAX  Hardcoded 65536 in ds4_server.c, does NOT scale with -c (it was
-#      = 65536  sized for a -c 131072 box where ctx/2 happened to equal 65536).
-#               At 1M ctx that is a cliff at 6.5% of context.
+#   SERIAL_MAX  Hardcoded 65536 in ds4_server.c, does NOT scale with -c. This
+#      = 65536  script used to raise it to CTX on the theory that a slow success
+#               beats a fast failure. We now leave ds4's default alone -- see
+#               below.
 #
-# Tradeoff on the third: raising it turns a fast 503 into a slow success, and
-# the serial lane is what drives the creep above. MAX_OUT and COALESCE_MAX are
-# what actually keep the batch lane funded; SERIAL_MAX_TOKENS is the safety net
-# for when it is not. Set --serial-max-tokens 0 to fail fast instead.
+# ---- why SERIAL_MAX_TOKENS is no longer raised to CTX ---------------------
+# Reading the engine changed this call. ds4_server.c:15513 documents what the
+# serial lane actually does at depth: it takes the managed-KV fallback, which is
+# "minutes of prefill, ~40x slower decode", and the continuous-admission reject
+# that bounced the job there is usually TRANSIENT (a comp-budget read during a
+# memory dip). So raising the guard does not convert a failure into a success --
+# it converts a fast, retryable 503 into a request that appears to hang for
+# minutes and then returns at 0.5 tok/s. On an interactive coding box that is
+# strictly worse: a 503 the client retries lands in a healthy admission, while a
+# 20-minute silent degradation is indistinguishable from a wedge.
+#
+# Two things that were true when CTX was chosen are no longer true:
+#   - The guard was believed to be the safety net that kept deep prompts working.
+#     It is not: it is only consulted on the continuous-lane FALLBACK sweep
+#     (ds4_server.c:15542). Requests routed serial by need -- buffered tool
+#     turns, live-frontier continuations, prefill-only -- dispatch at
+#     ds4_server.c:15664 without consulting it at all.
+#   - Recovering from a wedged server cost every deep session. With the disk KV
+#     tier below, a restart costs ~4s, so "fail fast and restart if it persists"
+#     is now a cheap strategy rather than an expensive one.
+# Set --serial-max-tokens $CTX to restore the old behavior, or 0 to disable the
+# guard's fallback entirely.
 #
 # MEM_FLOOR_GB is deliberately left at ds4's default of 4. With ~0.5 GiB of true
 # slack it is the only thing between this box and the OOM killer, and ds4 caches
@@ -118,7 +137,9 @@ KV_KIB_PER_TOKEN="${KV_KIB_PER_TOKEN:-35.6}"
 # Deep-context governance. See the header block for why these override ds4.
 MAX_OUT="${MAX_OUT:-32768}"                    # ds4 -n; ds4 default 393216
 COALESCE_MAX="${COALESCE_MAX:-4}"              # banks; ds4 default 32
-SERIAL_MAX_TOKENS="${SERIAL_MAX_TOKENS:-}"     # empty => CTX; 0 => fail fast
+# Empty => ds4's own default (65536). See the deep-serial note in the header:
+# this used to track CTX, which disabled the guard entirely.
+SERIAL_MAX_TOKENS="${SERIAL_MAX_TOKENS:-}"     # empty => ds4 default; 0 => off
 MEM_FLOOR_GB="${MEM_FLOOR_GB:-}"               # empty => ds4 default (4 GiB)
 
 # Disk KV checkpoints. Empty KV_DISK_DIR disables the feature entirely.
@@ -170,9 +191,15 @@ is_uint "$MAX_OUT"      || die "--max-out wants a non-negative integer (got '$MA
 is_uint "$COALESCE_MAX" || die "--coalesce-max wants a non-negative integer (got '$COALESCE_MAX')"
 (( COALESCE_MAX >= 1 )) || die "--coalesce-max must be >= 1 (got '$COALESCE_MAX')"
 
-# The deep-serial guard is a flat token count in ds4 and does not scale with -c,
-# so track CTX unless the operator pins it. 0 disables the fallback (fail fast).
-[ -n "$SERIAL_MAX_TOKENS" ] || SERIAL_MAX_TOKENS="$CTX"
+# Leave ds4's own default in place unless the operator pins a value. Earlier
+# revisions of this script set it to CTX, which disables the guard -- see the
+# deep-serial reversal in the header block.
+if [ -n "$SERIAL_MAX_TOKENS" ]; then
+    SERIAL_GUARD_NOTE="pinned"
+else
+    SERIAL_MAX_TOKENS=65536
+    SERIAL_GUARD_NOTE="ds4 default"
+fi
 is_uint "$SERIAL_MAX_TOKENS" \
     || die "--serial-max-tokens wants a non-negative integer (got '$SERIAL_MAX_TOKENS')"
 
@@ -254,15 +281,18 @@ note "weights  : $(bytes_gib "$W_BASE") GiB base + $(bytes_gib "$W_DRAFT") GiB D
 note "kv cache : $KV_GIB GiB  ($CTX tok x $KV_KIB_PER_TOKEN KiB/tok)"
 note "required : $NEED GiB of $TOTAL_GIB GiB RAM"
 note "bind     : $HOST:$PORT"
-note "governor : max_out=$MAX_OUT banks=$COALESCE_MAX serial_max=$SERIAL_MAX_TOKENS\
- mem_floor=${MEM_FLOOR_GB:-4} GiB"
+note "governor : max_out=$MAX_OUT banks=$COALESCE_MAX\
+ serial_max=$SERIAL_MAX_TOKENS (${SERIAL_GUARD_NOTE}) mem_floor=${MEM_FLOOR_GB:-4} GiB"
 if [ -n "$KV_DISK_DIR" ]; then
     note "kv disk  : $KV_DISK_DIR (budget ${KV_DISK_MB} MiB, cold saves up to $CTX tok)"
 else
     note "kv disk  : disabled -- a restart loses every deep session"
 fi
 if (( SERIAL_MAX_TOKENS == 0 )); then
-    note "           serial fallback OFF -- deep prompts get 503 rather than degrade"
+    note "           serial fallback OFF -- cont-rejected prompts get 503, never serial"
+elif (( SERIAL_MAX_TOKENS < CTX )); then
+    note "           cont-rejected prompts deeper than $SERIAL_MAX_TOKENS get a"
+    note "           retryable 503 instead of a ~40x-slower serial fallback"
 fi
 
 # This estimate is an UPPER bound: ds4-server mmaps the base GGUF unpinned and

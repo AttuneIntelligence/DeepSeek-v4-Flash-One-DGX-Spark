@@ -189,7 +189,7 @@ Environment variables (all optional; each has a matching flag):
 | `LOG` | `~/ds4-server.log` | Server log |
 | `MAX_OUT` | `32768` | Default max output tokens (`ds4-serve -n`) |
 | `COALESCE_MAX` | `4` | Concurrent batch banks |
-| `SERIAL_MAX_TOKENS` | `$CTX` | Deep-serial fallback cutoff; `0` = fail fast |
+| `SERIAL_MAX_TOKENS` | ds4's `65536` | Deep-serial fallback cutoff; `0` = fail fast |
 | `MEM_FLOOR_GB` | ds4's `4` | Memory admissions must leave free |
 | `KV_DISK_DIR` | `~/ds4-kv` | Disk KV checkpoints; empty disables |
 | `KV_DISK_MB` | `65536` | Disk budget (ds4's default when enabled is 4096) |
@@ -244,7 +244,7 @@ Three ds4 defaults are wrong for a 1M-context box, so `start.sh` overrides them:
 
 - **`-n 393216`** — every admission credits `prompt + max_out` tokens of KV growth and holds it for the row's lifetime, so a 68k prompt reserves 461k tokens. `MAX_OUT` caps the default; clients that send their own `max_tokens` are unaffected.
 - **`DS4_SERVER_COALESCE_MAX=32`** — ds4 asks for 32 banks, the fit claws it back to ~9, and those still commit ~7 of the 15 free GiB. This box cannot serve 32 concurrent 1M streams; `4` returns ~3.8 GiB to the usable pool.
-- **`DS4_SERVER_SERIAL_MAX_TOKENS=65536`** — hardcoded and does *not* scale with `-c`; it was sized for a `-c 131072` box where `ctx/2` happened to equal 65536. At 1M context that is a cliff at 6.5% of context.
+- **`DS4_SERVER_SERIAL_MAX_TOKENS`** — this script used to raise it to `$CTX`. That was backwards and has been reverted: the engine's own note (`ds4_server.c:15513`) records that the serial lane at depth means "minutes of prefill, ~40x slower decode", so raising the guard turns a fast retryable 503 into an apparent hang. See [`docs/performance.md`](docs/performance.md#the-serial-lane-wedge-has-a-root-cause-and-it-is-structural).
 
 Raising the serial cutoff turns a fast 503 into a slow success, and the serial lane is what drives the creep in the first place. `MAX_OUT` and `COALESCE_MAX` are what actually keep the batch lane funded; `SERIAL_MAX_TOKENS` is the safety net for when they are not. Use `--serial-max-tokens 0` to fail fast instead.
 
@@ -319,10 +319,10 @@ At 771k tokens — 77% of the window — decode still runs at 49% of peak while 
 
 | pass | served from cache | TTFT |
 |---|---:|---:|
-| cold, empty disk cache | 0 | 126,433 ms |
-| after a **full server restart** | 125,440 of 125,517 | **4,219 ms** |
+| cold, empty disk cache | 0 | 133,091 ms |
+| after a **full server restart** | 128,512 of 128,530 | **2,140 ms** |
 
-30x, with the checkpoint load itself taking 659 ms. Checkpoints cost ~4.6 KiB/token on disk against ~35.6 KiB/token resident. This is what makes retuning, model switching and wedge recovery affordable at 1M context. `--no-kv-disk` opts out.
+30–60x across two runs (the cold side is stable, the warm side varies), with the checkpoint load itself taking 659 ms. Verify it yourself with `make bench-restart`, which prefills deep, restarts the server, re-sends the identical prompt and records the row. Checkpoints cost ~4.6 KiB/token on disk against ~35.6 KiB/token resident. This is what makes retuning, model switching and wedge recovery affordable at 1M context. `--no-kv-disk` opts out.
 
 **Serving from local NVMe rather than the NAS was the single largest effect measured**: boot 9m40s → 60s, and deep prefill stops stalling on demand-paged expert weights. `make localize MODEL=abliterated`.
 
@@ -352,7 +352,8 @@ Lines worth watching:
 | `tools/models.sh` | The weight table and the source/local resolver, shared by the scripts |
 | `tools/fetch-weights.sh` | Download a weight set and leave it servable |
 | `tools/gguf_dspark_remap.py` | Repair a legacy `mtp.*` DSpark drafter into ds4's `dspark.*` layout |
-| `tools/bench.py` | Benchmark harness: depth sweep, concurrency, retrieval, cache |
+| `tools/bench.py` | Benchmark harness: depth, concurrency, retrieval, cache, restart |
+| `tools/kv-status.sh` | Disk KV tier: usage, budget pressure, restores, admissions |
 | `docs/dspark-drafter-repair.md` | Why the abliterated drafter needs repairing, and exactly what changes |
 | `tools/plot_bench.py` | Render `bench.png` from the recorded results |
 | `docs/performance.md` | Every serving default, justified with measurements |
