@@ -7,7 +7,13 @@
 
 The most intelligence we can pack onto a single NVIDIA DGX Spark: DeepSeek-V4-Flash served at a million tokens of context, filling 121 of the box's 122 gigabytes, on a native engine built for the chip rather than a general-purpose server. Thin, idempotent launcher scripts expose an OpenAI-compatible `/v1` API on `:8888`.
 
-This is an Attune Intelligence fork. It adds deep-context memory governance and a `stock`/`abliterated` model switch on top of the launcher, and it stands on three pieces of upstream work:
+```bash
+make bootstrap    # engine, both weight sets, drafter repair, verify
+make serve        # abliterated at 1M context on 0.0.0.0:8888, speculation armed
+make bench        # depth sweep, concurrency, retrieval, cache
+```
+
+This is an Attune Intelligence fork. It adds deep-context memory governance, a `stock`/`abliterated` model switch, a GGUF repair that makes the abliterated set speculate at all, and a benchmark harness that sweeps context depth rather than reporting one number. It stands on three pieces of upstream work:
 
 - [antirez/ds4](https://github.com/antirez/ds4) — DwarfStar 4, the upstream engine (MIT, C/CUDA)
 - [Entrpi/ds4-on-spark](https://github.com/Entrpi/ds4-on-spark) — the DGX Spark installer, benchmarks, and roofline analysis `start.sh` pulls
@@ -36,49 +42,96 @@ Thanks to Bleys Goodson ([@bleysg](https://x.com/bleysg)).
 ## Quick start
 
 ```bash
-./start.sh --install   # first time only: build the fork, fetch weights, install ds4-serve
-./start.sh             # full DSpark stack on 0.0.0.0:8888 at 1M context
+make bootstrap        # engine + both weight sets + drafter repair + verify
+make serve            # serve on 0.0.0.0:8888 at 1M context
+make serve MODEL=stock  # the standard 0731 weights instead
+make status           # what is running
 ```
 
-`--install` runs the upstream installer, which clones and builds the pinned fork, downloads the ~110 GiB GGUF set, smoke-tests, and installs `ds4-serve`. After that, plain `./start.sh` resolves the weights, prints the memory arithmetic, and launches the server directly.
+`abliterated` is the default weight set — see [why we run abliterated weights](#why-we-run-abliterated-weights). `MODEL=stock` selects the standard build anywhere `MODEL` is accepted.
+
+`make bootstrap` is idempotent and resumable. It installs `ds4-serve` if it is missing (via the upstream installer, weights skipped), downloads whatever GGUFs are not already on disk, runs the DSpark drafter repair the abliterated set needs, and verifies every drafter against the engine's schema. Re-running it after a partial download resumes rather than restarts.
+
+Everything is still usable directly — the Makefile is a table of contents, not a wrapper layer:
+
+```bash
+./start.sh --model stock --restart
+tools/fetch-weights.sh --check all
+tools/gguf_dspark_remap.py --verify DRAFTER.gguf
+```
+
+`make help` lists every target.
 
 ## Models
 
-Two weight sets are supported. `--list` shows which are present and where they resolved from:
+Two weight sets are supported. `make list` shows which are present, where they resolved from, and whether their drafter is ready:
 
-```bash
-./start.sh --list
-./start.sh --model abliterated --restart
+```
+$ make list
+MODEL          SOURCE    DRAFTER       PATH
+stock          local     ready         /home/reed/gguf
+abliterated    empress   ready         /home/reed/Empress/models/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128
 ```
 
 | Name | Aliases | Weights |
 |---|---|---|
+| `abliterated` *(default)* | `ablit`, `headroom128`, `hr128` | `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128` |
 | `stock` | `base`, `antirez`, `iq2xxs` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731` |
-| `abliterated` | `ablit`, `headroom128`, `hr128` | `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128` |
 
-Each entry needs both its base GGUF and its matching DSpark drafter in the same directory. Weights are looked up under `$LOCAL_GGUF_DIR` first, then `$MODELS_ROOT/<subdir>` — a local copy wins because pulling 86 GiB over NFS costs about four minutes. Force one side with `--local` / `--empress`.
+Each entry needs both its base GGUF and a servable DSpark drafter in the same directory. Weights are looked up under `$LOCAL_GGUF_DIR` first, then `$MODELS_ROOT/<subdir>`. A local copy wins, and it matters more than it looks: booting the abliterated set off the NAS took 9m40s of load time against roughly 1m30s from local NVMe, because the engine repacks 79 GiB of aligned artifacts at startup and every byte of that crosses the wire. `make localize MODEL=abliterated` copies a set down; `--local` / `--empress` force one side.
+
+The weight table lives in [`tools/models.sh`](tools/models.sh) and is shared by the launcher and the fetcher, so there is exactly one place to add a model.
 
 ## Getting the weights
 
-`--install` fetches the `stock` set through the upstream installer. The `abliterated` set is published separately on Hugging Face, and each set is two files: the target GGUF and its matching DSpark drafter. Both must land in the same directory (`$LOCAL_GGUF_DIR`, default `~/gguf`, or a `$MODELS_ROOT` subdirectory).
-
-The variant we run is [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128), the 128 GiB-headroom build, sized for a clean 1M context on a 122 GiB box:
+Each set is two files: the target GGUF and its matching DSpark drafter, both in the same directory. `make weights` fetches them and leaves them servable:
 
 ```bash
-# Into the local dir start.sh checks first ($LOCAL_GGUF_DIR, default ~/gguf).
-# The resolver wants both files directly in this directory, not nested.
-huggingface-cli download apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128 \
-  --local-dir ~/gguf --include "*.gguf"
+make weights MODEL=abliterated          # into $LOCAL_GGUF_DIR (default ~/gguf)
+make weights MODEL=stock DEST=empress   # into $MODELS_ROOT/<subdir> instead
+make weights-check                      # report what is present, download nothing
 ```
 
-That pulls the target (`...Headroom128.gguf`, 80.76 GiB) and the drafter (`...Headroom128-DSpark-support.gguf`, 5.58 GiB). Confirm and serve:
+| Set | File | Size | Source |
+|---|---|---|---|
+| `stock` | `DeepSeek-V4-Flash-IQ2XXS-...-0731.gguf` | 80.76 GiB | [`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf) |
+| `stock` | `DSpark-drafter-Q2K-Q8-0731.gguf` | 6.49 GiB | [`bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) |
+| `abliterated` | `...-DS4-Headroom128.gguf` | 80.76 GiB | [`apetersson/...-DS4-Headroom128`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128) |
+| `abliterated` | `...-DS4-Headroom128-DSpark-support.gguf` | 5.58 GiB | same repo — **repaired before use**, see below |
+
+Downloads go through the Hugging Face CLI (`hf`) when it is installed and fall back to resumable `curl` otherwise. Both paths are safe to re-run: a file whose size already matches the remote is skipped, a truncated one resumes. Set `HF_TOKEN` if you are pulling from a gated repo.
+
+The abliterated variant we run is the 128 GiB-headroom build, sized for a clean 1M context on a 122 GiB box. Its FP8 parent is [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8); the refusal direction it was projected against comes from [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32).
+
+## The abliterated set needs its drafter repaired
+
+As published, the abliterated set cannot speculate. `ds4-server` aborts during load:
+
+```
+ds4: required tensor is missing: dspark.main_proj.weight
+```
+
+Its three-stage DSpark support model is exported under upstream's legacy `mtp.*` tensor names and legacy metadata keys, while ds4's DSpark loader wants `dspark.*` and `deepseek4.dspark.*`. The files are otherwise identical — 81 tensors, same shapes, same three stages distilled against target layers 40/41/42 — so this is a metadata defect, not a weights defect.
+
+There is no useful fallback. The `mtp.*` names ds4 *does* know belong to the legacy MTP module, a different thing that expects tensors this file does not have, and `ds4-serve` refuses to pair any legacy MTP GGUF with an 0731-generation base. `--no-dspark` therefore drops straight to plain decode: roughly 3.5x fewer tokens per step.
+
+[`tools/gguf_dspark_remap.py`](tools/gguf_dspark_remap.py) repairs it. It rewrites the header — renaming tensors, remapping the six metadata keys, deriving the `expert_count` ds4 requires from the router width — and copies the tensor payload verbatim. Thirteen tensors also need widening, because ds4 type-checks everything outside the routed-expert bank and the Headroom128 profile is more aggressive than the reference drafter (`markov_w1/w2` Q8_0 → F16, `ffn_gate_inp` and `conf_proj` Q8_0 → F32, the `hc_*_fn` family F16 → F32). Every one of those is an upcast; the tool refuses to requantize or downcast, because that would silently change the model. Cost: +72 MiB and about 15 seconds.
+
+You do not normally invoke it. `make weights` runs it, and `start.sh` runs it on resolve if it finds a published-but-unrepaired drafter — the repaired `...-DSpark-support-ds4.gguf` lands beside the original, which is never modified.
 
 ```bash
-./start.sh --list                     # abliterated should now show 'local'
-./start.sh --model abliterated --restart
+make repair MODEL=abliterated    # rebuild it
+make verify                      # check every drafter against ds4's schema
 ```
 
-To share weights across hosts over NFS instead, drop the same two files in `$MODELS_ROOT/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128/` (default `~/Empress/models/...`).
+The proof it worked is in the log:
+
+```
+ds4: DSpark drafter loaded: ...-DSpark-support-ds4.gguf (3 layers)
+ds4: CONT_MTP_ACCEPT(DSpark) D=4 steps=265 emit=988 drafts=856 hits=723 accept=84.5% tok/step=3.73
+```
+
+Full details, including the exact name and dtype maps and how the payload was validated: [`docs/dspark-drafter-repair.md`](docs/dspark-drafter-repair.md).
 
 The FP8 parent this was converted from is [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-FP8); the refusal direction it was projected against comes from [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32).
 
@@ -104,6 +157,15 @@ We run this behind our own access controls, and we are not claiming the model is
 ## Usage
 
 ```bash
+make serve MODEL=abliterated      # restart onto a weight set
+make serve PORT=8889 CTX=262144   # different port, smaller context budget
+make dry-run                      # print the exact exec line and stop
+make stop | make status | make logs
+```
+
+Every Makefile variable maps to a `start.sh` flag, and the script takes anything the Makefile does not:
+
+```bash
 PORT=8889 ./start.sh              # different port
 CTX=262144 ./start.sh             # smaller context budget (KV ~= 35.6 KiB/token)
 ./start.sh --host 127.0.0.1       # loopback only; default binds 0.0.0.0
@@ -117,7 +179,7 @@ Environment variables (all optional; each has a matching flag):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MODEL` | `stock` | Weight set — see [Models](#models) |
+| `MODEL` | `abliterated` | Weight set — see [Models](#models) |
 | `PORT` | `8888` | Server port |
 | `HOST` | `0.0.0.0` | Bind address |
 | `CTX` | `1000000` | Context budget (KV ~= 35.6 KiB/token on this box) |
@@ -131,6 +193,33 @@ Environment variables (all optional; each has a matching flag):
 | `MEM_FLOOR_GB` | ds4's `4` | Memory admissions must leave free |
 
 The last four are deliberate deviations from ds4's own defaults — see below.
+
+## Steering at the inference layer
+
+Your client is not the only place behaviour is decided. Three `ds4-server` defaults will surprise you if you assume llama.cpp or vLLM semantics — full detail in [`docs/inference-controls.md`](docs/inference-controls.md).
+
+**System prompts are honoured**, and tightly enough to pin output format for machine consumers:
+
+```bash
+curl -s localhost:8888/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "ds4",
+  "messages": [{"role":"system","content":"Answer with a single lowercase word."},
+               {"role":"user","content":"What is the capital of France?"}]}' \
+  | jq -r '.choices[0].message.content'      # paris
+```
+
+**Thinking mode is on by default**, and it is not cheap:
+
+| request | completion tokens | `content` |
+|---|---:|---|
+| default | 56 | `paris` |
+| `"thinking": {"type": "disabled"}` | **2** | `paris` |
+
+Same answer, 28x the tokens. Reasoning comes back out-of-band in `message.reasoning_content`, so `content` stays clean. Turn it off with `thinking:{type:disabled}`, `think:false`, or `model=deepseek-chat`; turn it up with `reasoning_effort: low|high|max`.
+
+**In thinking mode, client sampling knobs are ignored** — `temperature: 0` does nothing and runs are not reproducible. If you need determinism, you need non-thinking mode. For coding agents the rule of thumb is thinking *off* for tool-call and edit loops (format-bound, 28x cheaper, deterministic) and *on* for planning and debugging turns.
+
+One trap worth knowing: thinking mode with a tight `max_tokens` truncates before the reasoning block closes, and the server then emits the unfinished deliberation as your answer (`thinking not closed, ignoring DSML in reasoning`). It looks exactly like a model quality failure. Our own retrieval benchmark scored 2/6 that way; with thinking disabled and the format pinned by a system prompt, the identical prompts score **6/6 at 128k tokens**, including a needle at 90% depth.
 
 ## Deep-context memory governance
 
@@ -188,9 +277,45 @@ curl http://127.0.0.1:8888/v1/models
 
 ## Performance
 
-![Performance on a single NVIDIA DGX Spark](bench.jpg)
+![Decode and prefill throughput versus context depth on a single NVIDIA DGX Spark](bench.png)
 
-Measured on a single NVIDIA DGX Spark (GB10 / SM121).
+Measured on a single NVIDIA DGX Spark (GB10 / SM121), abliterated weights, 1M context, DSpark speculation armed, weights on local NVMe. The figure is generated from `bench/results/` — no hand-entered numbers — and everything here is reproducible:
+
+```bash
+make bench            # depth sweep, cache, concurrency, retrieval -> bench/results/
+make plot             # redraw bench.png from those results
+make bench-depth      # just the curve above
+```
+
+Full method, caveats and the reasoning behind every serving default: [`docs/performance.md`](docs/performance.md).
+
+**Decode degrades gracefully with depth — it does not fall off a cliff.** `abliterated`, 1M context, one stream:
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s |
+|---:|---:|---:|---:|
+| 8,058 | 8.8 s | 916 | 26.9 |
+| 32,156 | 32.8 s | 982 | **27.2** |
+| 128,530 | 132 s | 975 | 21.2 |
+| 257,035 | 281 s | 914 | 21.6 |
+| 514,041 | 631 s | 815 | 16.9 |
+| 771,048 | 1,056 s | 730 | 13.2 |
+
+At 771k tokens — 77% of the window — decode still runs at 49% of peak while carrying 24x the context.
+
+**Prefix caching is what makes that window practical.** The same 128k prompt, twice:
+
+| pass | served from cache | TTFT | decode tok/s |
+|---|---:|---:|---:|
+| cold | 0 | 131,116 ms | 13.5 |
+| warm | 128,512 of 128,525 | **541 ms** | 19.2 |
+
+242x faster to first token. A coding agent does not resend 300k fresh tokens per turn, it sends the same context plus a diff — so the linear prefill cost of depth is a one-time entry fee per session, not a per-turn tax. That is the argument for keeping the window at 1M rather than trading it for the ~10% of decode rate a 262k window buys back.
+
+**Concurrency is real headroom** — 1.9x aggregate decode at 4 streams — but it costs per-stream latency, so it is throughput for a fleet rather than speed for one user.
+
+**Serving from local NVMe rather than the NAS was the single largest effect measured**: boot 9m40s → 60s, and deep prefill stops stalling on demand-paged expert weights. `make localize MODEL=abliterated`.
+
+The 20 CPU cores sitting idle are not wasted throughput: the GPU runs at 96% utilization at max boost with no power or thermal cap, CUDA graph capture is already on, and on a unified-memory part recruiting CPU cores would contend for the same LPDDR5X bus that decode is bound by. Details and the numbers behind each claim: [`docs/performance.md`](docs/performance.md).
 
 ## Logs
 
@@ -208,8 +333,20 @@ Lines worth watching:
 
 ## Files
 
-| File         | Purpose                                     |
-|--------------|---------------------------------------------|
-| `start.sh`   | Resolve weights, check memory, serve on `:8888` (`--install` for first-time setup) |
-| `stop.sh`    | Stop the `ds4-server` process              |
-| `bench.jpg`  | Decode throughput benchmark (tok/s vs context) on a single DGX Spark |
+| Path | Purpose |
+|---|---|
+| `Makefile` | Every workflow in the repo: bootstrap, weights, serve, bench, verify |
+| `start.sh` | Resolve weights, repair the drafter if needed, check memory, serve on `:8888` |
+| `stop.sh` | Stop the `ds4-server` process |
+| `tools/models.sh` | The weight table and the source/local resolver, shared by the scripts |
+| `tools/fetch-weights.sh` | Download a weight set and leave it servable |
+| `tools/gguf_dspark_remap.py` | Repair a legacy `mtp.*` DSpark drafter into ds4's `dspark.*` layout |
+| `tools/bench.py` | Benchmark harness: depth sweep, concurrency, retrieval, cache |
+| `docs/dspark-drafter-repair.md` | Why the abliterated drafter needs repairing, and exactly what changes |
+| `tools/plot_bench.py` | Render `bench.png` from the recorded results |
+| `docs/performance.md` | Every serving default, justified with measurements |
+| `docs/inference-controls.md` | System prompts, thinking mode, and what ds4 ignores |
+| `bench/results/` | Recorded runs, one JSONL row per measurement |
+| `bench.png` | Generated by `make plot` from `bench/results/` |
+
+Adding a model means one line in `tools/models.sh`; the launcher, the fetcher and the repair all read from that table.

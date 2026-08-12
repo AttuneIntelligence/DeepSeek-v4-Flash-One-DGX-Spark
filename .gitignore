@@ -1,3 +1,5 @@
 start.sh.orig
 *.orig
 ds4-server.log
+__pycache__/
+*.pyc

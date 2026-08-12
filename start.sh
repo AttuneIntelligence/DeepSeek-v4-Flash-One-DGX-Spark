@@ -12,9 +12,19 @@
 # (it does support --host) and only falls back to the upstream installer when
 # you explicitly ask for it with --install.
 #
+# Most workflows have a Makefile target: `make serve MODEL=abliterated`,
+# `make weights`, `make bench`, `make list`. See `make help`. This script stays
+# usable on its own; the Makefile is a table of contents, not a wrapper.
+#
+# The weight table, the local/NFS resolver and the DSpark drafter repair live in
+# tools/models.sh, shared with tools/fetch-weights.sh. If a model ships its
+# drafter under the legacy `mtp.*` names (the abliterated set does), it is
+# repaired into ds4's `dspark.*` layout on resolve -- see
+# docs/dspark-drafter-repair.md.
+#
 # Usage:
-#   ./start.sh                         # stock model, 1M ctx, 0.0.0.0:8888
-#   ./start.sh --model abliterated     # abliterated DS4-Headroom128 build
+#   ./start.sh                         # abliterated (default), 1M ctx, 0.0.0.0:8888
+#   ./start.sh --model stock           # the standard antirez 0731 weights
 #   ./start.sh --list                  # show models and where they resolve
 #   ./start.sh --restart               # stop whatever is serving, then start
 #   ./start.sh --host 127.0.0.1        # loopback only
@@ -72,7 +82,7 @@
 # it in a static on first read, so it cannot be retuned without a restart.
 set -euo pipefail
 
-MODEL="${MODEL:-stock}"
+MODEL="${MODEL:-abliterated}"
 PORT="${PORT:-8888}"
 CTX="${CTX:-1000000}"
 HOST="${HOST:-0.0.0.0}"
@@ -152,55 +162,41 @@ if (( COALESCE_MAX < 2 )); then
 fi
 
 # ---------------------------------------------------------------- model table
-# Each entry: <subdir>|<base gguf>|<dspark gguf>
-model_spec() {
-    case "$1" in
-        stock|base|antirez|iq2xxs)
-            echo "DeepSeek-v4-Flash|DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf|DSpark-drafter-Q2K-Q8-0731.gguf" ;;
-        abliterated|ablit|headroom128|hr128)
-            echo "DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128|DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf|DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf" ;;
-        *) return 1 ;;
-    esac
-}
-ALL_MODELS="stock abliterated"
-
-# Pick the directory that actually holds both files, honouring $SOURCE.
-resolve_dir() {
-    local sub="$1" base="$2" dspark="$3" nfs="$MODELS_ROOT/$1" loc="$LOCAL_GGUF_DIR"
-    local have_nfs=0 have_loc=0
-    [[ -f "$nfs/$base" && -f "$nfs/$dspark" ]] && have_nfs=1
-    [[ -f "$loc/$base" && -f "$loc/$dspark" ]] && have_loc=1
-    case "$SOURCE" in
-        local)   (( have_loc )) && { echo "$loc"; return 0; }; return 1 ;;
-        empress) (( have_nfs )) && { echo "$nfs"; return 0; }; return 1 ;;
-        auto)    (( have_loc )) && { echo "$loc"; return 0; }
-                 (( have_nfs )) && { echo "$nfs"; return 0; }; return 1 ;;
-        *) die "--source must be auto, empress or local (got '$SOURCE')" ;;
-    esac
-}
+# The weight table, the source/local resolver and the DSpark drafter repair all
+# live in tools/models.sh so fetch-weights.sh can share them.
+REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=tools/models.sh
+. "$REPO_DIR/tools/models.sh"
 
 if (( DO_LIST )); then
-    printf '%-14s %-9s %s\n' MODEL SOURCE PATH
+    printf '%-14s %-9s %-13s %s\n' MODEL SOURCE DRAFTER PATH
     for m in $ALL_MODELS; do
-        IFS='|' read -r sub base dspark <<<"$(model_spec "$m")"
-        if d="$(resolve_dir "$sub" "$base" "$dspark")"; then
+        if d="$(resolve_dir "$m")"; then
             case "$d" in "$LOCAL_GGUF_DIR") s=local ;; *) s=empress ;; esac
-            printf '%-14s %-9s %s\n' "$m" "$s" "$d"
+            if [ -f "$d/$(model_field "$m" dspark)" ]; then k=ready; else k=needs-repair; fi
+            printf '%-14s %-9s %-13s %s\n' "$m" "$s" "$k" "$d"
         else
-            printf '%-14s %-9s %s\n' "$m" MISSING "$MODELS_ROOT/$sub"
+            printf '%-14s %-9s %-13s %s\n' "$m" MISSING - \
+                "$MODELS_ROOT/$(model_field "$m" sub)"
         fi
     done
     exit 0
 fi
 
-IFS='|' read -r SUB BASE DSPARK <<<"$(model_spec "$MODEL")" \
-    || die "unknown --model '$MODEL' (known: $ALL_MODELS)"
+model_spec "$MODEL" >/dev/null || die "unknown --model '$MODEL' (known: $ALL_MODELS)"
+SUB="$(model_field "$MODEL" sub)"
+BASE="$(model_field "$MODEL" base)"
+DSPARK="$(model_field "$MODEL" dspark)"
 
 # Touch the autofs path so the NFS mount is triggered before we probe it.
 [ -d "$MODELS_ROOT" ] || die "$MODELS_ROOT is not available (is the Empress NFS mount up?)"
 
-SRCDIR="$(resolve_dir "$SUB" "$BASE" "$DSPARK")" \
-    || die "model '$MODEL' not found. Looked in $MODELS_ROOT/$SUB and $LOCAL_GGUF_DIR"
+SRCDIR="$(resolve_dir "$MODEL")" || die \
+"model '$MODEL' not found. Looked in $MODELS_ROOT/$SUB and $LOCAL_GGUF_DIR.
+       Fetch it with:  make weights MODEL=$(model_canonical "$MODEL")"
+
+# Published-but-legacy drafter and no repaired one yet: build it before serving.
+ensure_drafter "$SRCDIR" "$MODEL" || true
 
 # ------------------------------------------------------------- legacy install
 if (( DO_INSTALL )); then
