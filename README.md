@@ -191,6 +191,8 @@ Environment variables (all optional; each has a matching flag):
 | `COALESCE_MAX` | `4` | Concurrent batch banks |
 | `SERIAL_MAX_TOKENS` | `$CTX` | Deep-serial fallback cutoff; `0` = fail fast |
 | `MEM_FLOOR_GB` | ds4's `4` | Memory admissions must leave free |
+| `KV_DISK_DIR` | `~/ds4-kv` | Disk KV checkpoints; empty disables |
+| `KV_DISK_MB` | `65536` | Disk budget (ds4's default when enabled is 4096) |
 
 The last four are deliberate deviations from ds4's own defaults — see below.
 
@@ -312,6 +314,15 @@ At 771k tokens — 77% of the window — decode still runs at 49% of peak while 
 **292x faster to first token** (range 289x-316x across three runs). A coding agent does not resend 300k fresh tokens per turn, it sends the same context plus a diff — so the linear prefill cost of depth is a one-time entry fee per session, not a per-turn tax. That is the argument for keeping the window at 1M rather than trading it for the ~10% of decode rate a 262k window buys back: a smaller window would not make warm turns faster, it would only evict them and charge the 134-second cold prefill again.
 
 **Concurrency is real headroom** — 1.9x aggregate decode at 4 streams — but it costs per-stream latency, so it is throughput for a fleet rather than speed for one user.
+
+**A server restart used to cost a deep session; now it costs about four seconds.** ds4 can checkpoint KV to disk and restore it into a bank instead of re-prefilling, but only if `--kv-disk-dir` is passed — it is off by default. `start.sh` now enables it:
+
+| pass | served from cache | TTFT |
+|---|---:|---:|
+| cold, empty disk cache | 0 | 126,433 ms |
+| after a **full server restart** | 125,440 of 125,517 | **4,219 ms** |
+
+30x, with the checkpoint load itself taking 659 ms. Checkpoints cost ~4.6 KiB/token on disk against ~35.6 KiB/token resident. This is what makes retuning, model switching and wedge recovery affordable at 1M context. `--no-kv-disk` opts out.
 
 **Serving from local NVMe rather than the NAS was the single largest effect measured**: boot 9m40s → 60s, and deep prefill stops stalling on demand-paged expert weights. `make localize MODEL=abliterated`.
 

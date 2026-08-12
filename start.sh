@@ -33,6 +33,11 @@
 #   ./start.sh --install               # legacy path: run upstream install.sh
 #   ./start.sh --no-dspark             # unknown flags pass through to ds4-serve
 #
+# Disk KV cache (see "disk KV" below):
+#   ./start.sh --kv-disk-dir /mnt/fast/ds4-kv   # where checkpoints live
+#   ./start.sh --kv-disk-mb 131072              # budget; default 65536 MiB
+#   ./start.sh --no-kv-disk                     # turn it off
+#
 # Memory governance (see "deep-context governance" below):
 #   ./start.sh --max-out 65536         # per-request KV credit; default 32768
 #   ./start.sh --coalesce-max 8        # concurrent batch banks; default 4
@@ -40,6 +45,21 @@
 #
 # Env equivalents: MODEL PORT CTX HOST SOURCE MODELS_ROOT LOCAL_GGUF_DIR LOG
 #                  MAX_OUT COALESCE_MAX SERIAL_MAX_TOKENS MEM_FLOOR_GB
+#                  KV_DISK_DIR KV_DISK_MB
+#
+# ---- disk KV -------------------------------------------------------------
+# ds4 can checkpoint KV state to disk and restore it into a bank instead of
+# re-prefilling. It is OFF in ds4 unless --kv-disk-dir is passed, and the win on
+# this box is large: a 125,517-token prompt re-sent ACROSS A FULL SERVER RESTART
+# went 126,433 ms -> 4,219 ms (30x), with 125,440 of 125,517 tokens restored from
+# a 549 MiB checkpoint in 659 ms. That turns a restart from "lose every deep
+# session" into "pay four seconds", which is what makes retuning, model switches
+# and wedge recovery affordable at 1M context.
+#
+# Checkpoints cost ~4.6 KiB/token on disk (vs ~35.6 KiB/token resident), so the
+# 64 GiB default budget holds roughly a dozen full-window sessions. ds4's own
+# default cold-save ceiling is 30000 tokens, which would skip every prompt this
+# box exists to serve, so we raise it to the full context.
 #
 # KV budget is ~35.6 KiB/token at ctx=1000000 (13.17 GiB kv cache + 20.80 GiB
 # context buffers, measured on this host) -- so 1M ctx ~= 34 GiB on top of the
@@ -101,6 +121,10 @@ COALESCE_MAX="${COALESCE_MAX:-4}"              # banks; ds4 default 32
 SERIAL_MAX_TOKENS="${SERIAL_MAX_TOKENS:-}"     # empty => CTX; 0 => fail fast
 MEM_FLOOR_GB="${MEM_FLOOR_GB:-}"               # empty => ds4 default (4 GiB)
 
+# Disk KV checkpoints. Empty KV_DISK_DIR disables the feature entirely.
+KV_DISK_DIR="${KV_DISK_DIR:-$HOME/ds4-kv}"
+KV_DISK_MB="${KV_DISK_MB:-65536}"              # ds4 default when enabled: 4096
+
 FOREGROUND=0; DO_LIST=0; DO_INSTALL=0; DO_RESTART=0; SKIP_MEMCHECK=0; DRY_RUN=0
 extra=()
 
@@ -129,6 +153,9 @@ while [[ $# -gt 0 ]]; do
         --coalesce-max)       COALESCE_MAX="$2"; shift 2 ;;
         --serial-max-tokens)  SERIAL_MAX_TOKENS="$2"; shift 2 ;;
         --mem-floor-gb)       MEM_FLOOR_GB="$2"; shift 2 ;;
+        --kv-disk-dir)        KV_DISK_DIR="$2"; shift 2 ;;
+        --kv-disk-mb)         KV_DISK_MB="$2"; shift 2 ;;
+        --no-kv-disk)         KV_DISK_DIR=""; shift ;;
         # -n is dry-run here for back-compat; ds4's -n is --max-out.
         --dry-run|-n) DRY_RUN=1; shift ;;
         --help|-h)    usage; exit 0 ;;
@@ -229,6 +256,11 @@ note "required : $NEED GiB of $TOTAL_GIB GiB RAM"
 note "bind     : $HOST:$PORT"
 note "governor : max_out=$MAX_OUT banks=$COALESCE_MAX serial_max=$SERIAL_MAX_TOKENS\
  mem_floor=${MEM_FLOOR_GB:-4} GiB"
+if [ -n "$KV_DISK_DIR" ]; then
+    note "kv disk  : $KV_DISK_DIR (budget ${KV_DISK_MB} MiB, cold saves up to $CTX tok)"
+else
+    note "kv disk  : disabled -- a restart loses every deep session"
+fi
 if (( SERIAL_MAX_TOKENS == 0 )); then
     note "           serial fallback OFF -- deep prompts get 503 rather than degrade"
 fi
@@ -252,7 +284,13 @@ if (( DRY_RUN )); then
     echo "    DS4_SERVER_COALESCE_MAX=$COALESCE_MAX \\"
     echo "    DS4_SERVER_SERIAL_MAX_TOKENS=$SERIAL_MAX_TOKENS \\"
     if [ -n "$MEM_FLOOR_GB" ]; then echo "    DS4_MEM_FLOOR_GB=$MEM_FLOOR_GB \\"; fi
-    echo "    ds4-serve -c $CTX -n $MAX_OUT --port $PORT --host $HOST ${extra[*]-}"
+    if [ -n "$KV_DISK_DIR" ]; then
+        echo "    ds4-serve -c $CTX -n $MAX_OUT --port $PORT --host $HOST \\"
+        echo "      --kv-disk-dir $KV_DISK_DIR --kv-disk-space-mb $KV_DISK_MB \\"
+        echo "      --kv-cache-cold-max-tokens $CTX ${extra[*]-}"
+    else
+        echo "    ds4-serve -c $CTX -n $MAX_OUT --port $PORT --host $HOST ${extra[*]-}"
+    fi
     exit 0
 fi
 
@@ -286,11 +324,22 @@ if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
     fi
 fi
 
+kv_args=()
+if [ -n "$KV_DISK_DIR" ]; then
+    mkdir -p "$KV_DISK_DIR" || die "cannot create KV_DISK_DIR $KV_DISK_DIR"
+    # ds4's cold-save ceiling defaults to 30000 tokens; on a 1M box that skips
+    # exactly the prompts worth checkpointing.
+    kv_args=(--kv-disk-dir "$KV_DISK_DIR"
+             --kv-disk-space-mb "$KV_DISK_MB"
+             --kv-cache-cold-max-tokens "$CTX")
+fi
+
 launch=(env "DS4_GGUF_DIR=$SRCDIR" "GGUF_FILE=$BASE" "DSPARK_FILE=$DSPARK"
         "DS4_SERVER_COALESCE_MAX=$COALESCE_MAX"
         "DS4_SERVER_SERIAL_MAX_TOKENS=$SERIAL_MAX_TOKENS"
         ${MEM_FLOOR_GB:+"DS4_MEM_FLOOR_GB=$MEM_FLOOR_GB"}
         ds4-serve -c "$CTX" -n "$MAX_OUT" --port "$PORT" --host "$HOST"
+        ${kv_args[@]+"${kv_args[@]}"}
         ${extra[@]+"${extra[@]}"})
 
 if (( FOREGROUND )); then

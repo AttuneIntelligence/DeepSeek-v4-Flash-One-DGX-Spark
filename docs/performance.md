@@ -236,6 +236,118 @@ starts evicting model pages that then have to be re-fetched. `make localize
 MODEL=abliterated` copies a set down at ~345 MB/s (92.79 GB in 4m16s). Do this
 before benchmarking anything, or you will benchmark your network.
 
+## Disk KV: a restart no longer costs a session
+
+`ds4-server` can checkpoint KV state to disk and restore it into a bank instead
+of re-prefilling. It is **off unless `--kv-disk-dir` is passed**, and we were not
+passing it. Measured here, same 125,517-token prompt, across a **full server
+restart** (new process, cold page cache):
+
+| pass | served from cache | TTFT |
+|---|---:|---:|
+| cold, empty disk cache | 0 | 126,433 ms |
+| after restart, restored from disk | 125,440 | **4,219 ms** |
+
+**30x**, of which the actual checkpoint load was 659 ms:
+
+```
+kv cache bank restore hit tokens=125548 bank=0 file=...kv load=659.4 ms
+bank restore admit bank=0 bytes=691490 lcp=691340 partial=1
+```
+
+The checkpoint was 549 MiB for 125k tokens — about **4.6 KiB/token on disk**
+against ~35.6 KiB/token resident, because the on-disk form is packed-native.
+
+This changes the economics of everything above. The warm-path argument for a 1M
+window previously had a hole in it: warm turns cost 0.46 s, but *any* restart —
+to switch models, retune the memory floor, or clear a wedge — dropped you back to
+134 s. With disk KV that penalty becomes ~4 s. It is now on by default in
+`start.sh` (`--no-kv-disk` opts out).
+
+Two defaults had to be overridden. ds4's budget when enabled is 4096 MiB, which
+holds less than one full-window session; we use 65536. And its cold-save ceiling
+is 30000 tokens, which would skip *every* prompt this box exists to serve; we set
+it to the full context.
+
+## Further tuning: what we checked and rejected
+
+The engine has a very large tunable surface (roughly 400 `DS4_*` variables). Most
+of what looks promising is either already on or measurably wrong for this box.
+
+**`DS4_SERVER_DEFAULT_TEMP=0` — the documentation is stale.** `misc/cuda-env-vars.md`
+claims that requests omitting `temperature` get the 1.0 default and are therefore
+"silently routed down the serial path — no continuous batching, no DSpark". That
+was true when written (2026-07-13); it is not true on v0.5.6.1. `job_is_batchable`
+(`ds4_server.c:13374`) does not test temperature at all — only the older *static*
+batch path does (`job_is_static_batchable`, `ds4_server.c:13402`). Verified
+empirically: requests with no temperature, with `temperature: 0`, and with tools
+all took `path=cont` with speculation active. There is still a real but
+second-order reason to prefer greedy — a deterministic target makes the drafter
+agree more often, so the speculative accept rate rises — but it is not the lane
+cliff the docs describe.
+
+**`DS4_SERVER_COALESCE_MAX`.** ds4's own default is 32 with fit-or-reduce, and the
+engine's shipped deep-context gate (`speed-bench/deep_ctx_gate.sh`) uses 8 at
+`-c 524288`. We use 4 because that is what fits at 1M; the fitter confirms it
+(`persistent batch ctx ready (max_seq=4 ...)`). Worth revisiting only alongside a
+smaller window.
+
+**`DS4_CONT_PREFILL_CHUNK`** is clamped to the session cap; setting 16384 leaves
+the server still reporting `prefill_chunk=4096`.
+
+**Already on, verified in our boot log** — packed FP8 KV primary, packed FP4
+indexer primary, per-layer CUDA graph capture, aligned Q2_K/IQ2_XXS/Q8_0 repack
+artifacts built in-process, fused MoE gate/up/swiglu. These have silent-failure
+modes (the FP8/FP4 primaries print `REFUSED` if VMM demand mapping is
+unavailable; a boot that misses the derived artifacts runs ~30% slower with no
+log tell), so they are worth grepping for after any config change.
+
+**Profiling, if you want to chase the 27 → 13 tok/s slope at depth**: the engine
+ships `DS4_CUDA_STAGE_PROF_LITE=1` for per-stage GPU spans (valid in production),
+`DS4_DSPARK_PROFILE=1` for the verify/accept/inject split, and
+`speed-bench/deep_decode_profile.sh`, which nsys-profiles *only* the warm decode
+window after a deep cold admit. We have not run these yet.
+
+## The serial-lane wedge has a root cause, and it is structural
+
+This repo already documented the wedge — the serial session right-sizes upward
+and never shrinks until `usable` hits zero and every admission is rejected. The
+engine source shows why, and it is worse than "it does not shrink":
+
+`serial_session_ensure_fit` (`ds4_server.c:13567`) re-creates the session only
+when `cur_ctx < need_min` (`ds4_server.c:13589`). Nothing re-creates it smaller.
+Worse, when it does grow it runs a binary search for **the largest ctx that
+currently fits** plus 32768 tokens of headroom (`ds4_server.c:13641-13654`) — so
+each step claims whatever the box happens to have free at that instant. That is
+exactly the observed 2561 → 16115 → 78924 ladder. `ds4_session_free` is called in
+only two places: inside that grow path, and at teardown.
+
+Two further findings worth knowing:
+
+- **The deep-serial guard does not cover the path that actually grows the graph.**
+  `DS4_SERVER_SERIAL_MAX_TOKENS` is only consulted in the continuous-lane
+  *fallback* sweep (`ds4_server.c:15542`). Requests routed serial *by need* —
+  buffered tool turns, live-frontier continuations, prefill-only — dispatch at
+  `ds4_server.c:15664` without consulting it, and grow the graph freely. This is
+  probably how a box with a 65536 guard reached 78924.
+- **Our `SERIAL_MAX_TOKENS=$CTX` may be backwards.** The engine's comment at
+  `ds4_server.c:15513` argues the opposite of this repo's README: at deep context
+  the serial lane takes the managed-KV fallback at "minutes of prefill, ~40x
+  slower decode", and the reject that bounced the job there is usually transient,
+  so a fast 503 the client can retry is better than a silent 40x degradation.
+  Setting the guard to the full context disables it. We have not changed this
+  yet — it deserves its own measurement, because "fail fast" and "always succeed
+  eventually" are a product decision, not just a perf one.
+
+Mitigations exist and all have real costs. `DS4_SERVER_SERIAL_RIGHTSIZE=0`
+(`ds4_server.c:17569`) stops the ratchet completely by making the serial lane
+never allocate — but that lane is not optional for requests routed to it by need,
+so tool-heavy workloads may start failing. `DS4_SESSION_GRAPH_HEADROOM_MB`
+(default 1024, `ds4.c:10188`) raises the bar the fit probe must clear and so caps
+how far the ratchet can climb, at the cost of more 503s. **We ship neither**, on
+the grounds that a documented restart beats an undocumented failure mode; disk KV
+now makes that restart cost ~4 s instead of a session.
+
 ## The resulting defaults
 
 | setting | value | why |
@@ -246,6 +358,8 @@ before benchmarking anything, or you will benchmark your network.
 | `SERIAL_MAX_TOKENS` | `$CTX` | ds4's hardcoded 65536 is a cliff at 6.5% of a 1M window. |
 | `MEM_FLOOR_GB` | 4 (ds4 default) | The only thing between this box and the OOM killer at 99.6% occupancy. |
 | weights location | local NVMe | 9.7x faster boot, and deep prefill does not stall. |
+| `--kv-disk-dir` | `~/ds4-kv`, 64 GiB | A restart costs ~4 s instead of 134 s. Off in ds4 by default. |
+| `--kv-cache-cold-max-tokens` | `$CTX` | ds4's 30000 default would skip every prompt this box exists to serve. |
 
 For a throughput-first deployment instead of a depth-first one:
 
